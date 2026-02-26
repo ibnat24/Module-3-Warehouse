@@ -39,7 +39,7 @@ ITEM_NAMES      = ['circle', 'pentagon', 'trapezoid', 'triangle',
 # ─────────────────────────────────────────────
 def parse_file(path):
     rows = []
-    with open(path) as f:
+    with open(path, encoding='utf-8-sig') as f:
         for line in f:
             line = line.strip()
             if not line:
