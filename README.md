@@ -132,7 +132,7 @@ LPT Lane Assignment is the dominant heuristic — it wins on every single random
 
 ## Adjustable Settings
 
-At the top of `MSE433_warehousing_analysis.py`:
+At the top of `algorithm.py`:
 
 ```python
 NUM_ORDERS      = 4    # change to use more orders (up to 11 in the CSV)
