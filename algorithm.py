@@ -101,6 +101,14 @@ def totes_miptf(all_totes, tote_orders_map, **_):
     """
     return sorted(all_totes, key=lambda t: -len(tote_orders_map[t]))
 
+def totes_mitf(all_totes, tote_contents, **_):
+    """
+    MITF – Most Items Total First.
+    Loads totes with the highest total quantity of items first.
+    Rationale: item placement takes time (ITEM_PLACE_TIME), so pushing large-work totes
+    earlier can reduce downstream completion times under placement bottlenecks.
+    """
+    return sorted(all_totes, key=lambda t: -sum(tote_contents[t]))
 
 # ─────────────────────────────────────────────
 # DECISION 2 — LANE ASSIGNMENT HEURISTICS
@@ -136,6 +144,37 @@ def lanes_lpt_penalty(orders, tote_sequence, order_totes_set, **_):
                          key=lambda oid: -last_tote_time(oid))
     return {oid: lane for lane, oid in enumerate(sorted_oids)}
 
+def lanes_mifl(orders, order_total_items, **_):
+    """
+    MIFL – Most Items to Fastest Lane.
+    Assign the order with the most total items to Lane 0 (lowest travel penalty),
+    next most to Lane 1, etc.
+    """
+    sorted_oids = sorted([o['id'] for o in orders],
+                         key=lambda oid: -order_total_items[oid])
+    return {oid: lane for lane, oid in enumerate(sorted_oids)}
+
+def lanes_wlpt(orders, tote_sequence, order_totes_set, order_total_items,
+               alpha=1.0, beta=6.0, **_):
+    """
+    WLPT – Weighted LPT.
+    Score = alpha*(last tote arrival time) + beta*(total items).
+    Highest score gets Lane 0 (best lane), etc.
+
+    beta defaults to 6.0 so "one extra item" is roughly comparable to one lane step
+    of travel-time scale. Feel free to tune.
+    """
+    pos = {t: i for i, t in enumerate(tote_sequence)}
+
+    def last_tote_time(oid):
+        return max(pos[t] for t in order_totes_set[oid]) * FULL_LOOP
+
+    def score(oid):
+        return alpha * last_tote_time(oid) + beta * order_total_items[oid]
+
+    sorted_oids = sorted([o['id'] for o in orders], key=lambda oid: -score(oid))
+    return {oid: lane for lane, oid in enumerate(sorted_oids)}
+
 
 # ─────────────────────────────────────────────
 # DECISION 3 — ITEM LOADING SEQUENCE HEURISTICS
@@ -167,63 +206,97 @@ def item_order_furthest_lane_first(items):
     """
     return sorted(items, key=lambda x: -x[2])  # highest lane first
 
+def item_order_biggest_qty_first(items):
+    """
+    BPF – Biggest Quantity First.
+    Place item types with the highest quantity first.
+    Rationale: large blocks consume more placement time (ITEM_PLACE_TIME per unit),
+    so starting them earlier reduces the chance they become the tail.
+    """
+    # items: (item_type, qty, lane)
+    return sorted(items, key=lambda x: -x[1])
+
+def item_order_weighted_flf(items):
+    """
+    WFLF – Weighted Furthest Lane First.
+    Sort by (lane * quantity) descending.
+    Rationale: combines travel delay (lane) and placement workload (qty).
+    """
+    return sorted(items, key=lambda x: -(x[2] * x[1]))
 
 # ─────────────────────────────────────────────
 # SIMULATION ENGINE
 # ─────────────────────────────────────────────
 def simulate(orders, tote_sequence, lane_assignment,
              tote_contents, item_order_fn=item_order_furthest_lane_first):
-    """
-    Simulate the full conveyor system including item placement timing.
 
-    Model
-    -----
-    - Tote at position i is available at t = i × FULL_LOOP
-    - Each item takes ITEM_PLACE_TIME seconds to place on the belt
-    - Item placed at time p, going to lane k, is sorted at p + k × TRAVEL_TIME
-    - Order completion = time when its LAST item is sorted
-    - Makespan = max order completion
-    """
-    # Build item_type → lane lookup
-    item_to_lane = {}
-    item_to_order = {}
+    # Remaining demand per order (shape -> qty)
+    remaining = {}
     for o in orders:
-        lane = lane_assignment[o['id']]
-        for item_type in o['types']:
-            item_to_lane[item_type]  = lane
-            item_to_order[item_type] = o['id']
+        need = {k: 0 for k in range(8)}
+        for j in range(len(o["types"])):
+            need[o["types"][j]] += o["quantities"][j]
+        remaining[o["id"]] = need
 
-    tote_load_start  = {t: idx * FULL_LOOP for idx, t in enumerate(tote_sequence)}
-    order_last_sort  = defaultdict(int)
+    tote_load_start = {t: idx * FULL_LOOP for idx, t in enumerate(tote_sequence)}
+    order_last_sort = defaultdict(int)
+
+    # Helper: pick which order should receive this shape (only among orders that still need it)
+    def choose_order_for_shape(shape):
+        candidates = [oid for oid in remaining if remaining[oid][shape] > 0]
+        if not candidates:
+            return None
+
+        # tie-break: prioritize orders closest to completion (fewest remaining items)
+        def remaining_items(oid):
+            return sum(remaining[oid].values())
+
+        return min(candidates, key=remaining_items)
 
     for tote_id in tote_sequence:
-        t_start  = tote_load_start[tote_id]
+        t_start = tote_load_start[tote_id]
         contents = tote_contents[tote_id]
 
-        items = [(item_type, contents[item_type], item_to_lane[item_type])
-                 for item_type in range(8)
-                 if contents[item_type] > 0 and item_type in item_to_lane]
-
+        # Create items list = (shape, qty, lane) BUT lane depends on which order takes it,
+        # so we only order by shape/qty first then decide assignment per unit.
+        items = [(shape, contents[shape]) for shape in range(8) if contents[shape] > 0]
         if not items:
             continue
 
-        items_ordered  = item_order_fn(items)
+        # For ordering within tote, we need lane info; approximate by "best possible lane"
+        # (max lane among orders needing it) so FLF still has meaning.
+        items_with_lane = []
+        for shape, qty in items:
+            lanes_needing = [lane_assignment[oid] for oid in remaining if remaining[oid][shape] > 0]
+            approx_lane = max(lanes_needing) if lanes_needing else 0
+            items_with_lane.append((shape, qty, approx_lane))
+
+        items_ordered = item_order_fn(items_with_lane)
         placement_time = t_start
 
-        for item_type, qty, lane in items_ordered:
-            oid = item_to_order[item_type]
-            for _ in range(qty):
+        for shape, qty, _ in items_ordered:
+            for _unit in range(qty):
+                oid = choose_order_for_shape(shape)
+                if oid is None:
+                    # no order needs this item anymore
+                    placement_time += ITEM_PLACE_TIME
+                    continue
+
+                lane = lane_assignment[oid]
                 sort_time = placement_time + lane * TRAVEL_TIME
+
+                remaining[oid][shape] -= 1
                 order_last_sort[oid] = max(order_last_sort[oid], sort_time)
+
                 placement_time += ITEM_PLACE_TIME
 
-    makespan = max(order_last_sort.values())
+    makespan = max(order_last_sort.values()) if order_last_sort else 0
     total_ct = sum(order_last_sort.values())
     return {
-        'order_completion': dict(order_last_sort),
-        'makespan':         makespan,
-        'total_completion': total_ct,
-        'avg_completion':   total_ct / len(order_last_sort),
+        "order_completion": dict(order_last_sort),
+        "makespan": makespan,
+        "total_completion": total_ct,
+        "avg_completion": total_ct / len(order_last_sort) if order_last_sort else 0,
     }
 
 
@@ -265,6 +338,7 @@ def print_comparison(results, baseline_r):
         print(f"  {name:<38}  {r['makespan']:>7.0f}s ({dm:>+5.1f}%)  "
               f"{r['total_completion']:>7.0f}s  {r['avg_completion']:>7.1f}s{flag}")
     print()
+
 
 
 def print_demo_instructions(best_r, tote_seq, lane_assignment,
@@ -332,6 +406,7 @@ def main():
      order_totes_set, all_totes) = build_indexes(orders)
 
     ctx = dict(orders=orders, all_totes=all_totes,
+                tote_contents=tote_contents,        
                tote_orders_map=tote_orders_map,
                order_num_totes=order_num_totes,
                order_total_items=order_total_items,
@@ -340,19 +415,35 @@ def main():
     tseq_b = totes_baseline(**ctx)
     tseq_e = totes_eocf(**ctx)
     tseq_m = totes_miptf(**ctx)
+    tseq_i = totes_mitf(**ctx)   # NEW
 
     lanes_b   = lanes_baseline(**ctx)
     lanes_lpt_b = lanes_lpt_penalty(tote_sequence=tseq_b, **ctx)
     lanes_lpt_e = lanes_lpt_penalty(tote_sequence=tseq_e, **ctx)
     lanes_lpt_m = lanes_lpt_penalty(tote_sequence=tseq_m, **ctx)
+    lanes_lpt_i = lanes_lpt_penalty(tote_sequence=tseq_i, **ctx)
+    lanes_mifl_b = lanes_mifl(**ctx)
+    lanes_mifl_e = lanes_mifl(**ctx)     # (doesn't depend on tote_sequence)
+
+    lanes_wlpt_b = lanes_wlpt(tote_sequence=tseq_b, **ctx)
+    lanes_wlpt_e = lanes_wlpt(tote_sequence=tseq_e, **ctx)
+    lanes_wlpt_i = lanes_wlpt(tote_sequence=tseq_i, **ctx)
 
     # All 6 strategies × 2 item orderings = compare clearly
     strategies = {
         'Baseline (naive everything)':       (tseq_b, lanes_b,     item_order_naive),
         'EOCF Totes + Naive Lanes':          (tseq_e, lanes_b,     item_order_naive),
+        'EOCF + MIFL (naive items)':          (tseq_e, lanes_mifl_e, item_order_naive),
+        'EOCF + WLPT (naive items)':          (tseq_e, lanes_wlpt_e, item_order_naive),
+        'MITF Totes + Naive Lanes':          (tseq_i, lanes_b,     item_order_naive),      
         'Baseline + LPT+Penalty':            (tseq_b, lanes_lpt_b, item_order_naive),
         'EOCF + LPT+Penalty (naive items)':  (tseq_e, lanes_lpt_e, item_order_naive),
+        'MITF + LPT+Penalty (naive items)': (tseq_i, lanes_lpt_i, item_order_naive),
+        'EOCF + LPT+Penalty + Naive Items': (tseq_e, lanes_lpt_e, item_order_naive),
+        'EOCF + LPT+Penalty + BPF Items':   (tseq_e, lanes_lpt_e, item_order_biggest_qty_first),
+        'EOCF + LPT+Penalty + WFLF Items':  (tseq_e, lanes_lpt_e, item_order_weighted_flf),
         '★ EOCF + LPT+Penalty + FLF Items': (tseq_e, lanes_lpt_e, item_order_furthest_lane_first),
+
     }
 
     results = {name: simulate(orders, ts, la, tote_contents, fn)
