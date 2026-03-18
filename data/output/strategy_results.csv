@@ -1,0 +1,4 @@
+rank,tote_rule,conv_rule,within_rule,makespan,total_completion,avg_completion
+1,ID_ASC,LPT_BALANCE,BPF,108,494,82.33333333333333
+2,ID_ASC,LPT_BALANCE_WT,BPF,108,495,82.5
+3,ID_ASC,BASELINE_CYCLE,BPF,110,476,79.33333333333333

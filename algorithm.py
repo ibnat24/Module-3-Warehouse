@@ -1,391 +1,738 @@
 """
-MSE 433 - Module 3: Warehousing Heuristic Analysis
-====================================================
-Demo version: First 4 orders, 4 lanes, one order per lane.
-PRIMARY KPI: Minimize Makespan.
+MSE 433 — Module 3 Conveyor Strategy (FAST) + TOP2 + RESULTS + LOADING PLANS
+============================================================================
 
-THREE decisions optimized:
-  1. Lane assignment   → which order goes in which lane (LPT+Penalty)
-  2. Tote sequence     → which tote to load first (EOCF)
-  3. Item sequence     → within a tote, which item to place first (Furthest Lane First)
+What this script does:
+- Loads generator CSVs:
+    order_itemtypes.csv, order_quantities.csv, orders_totes.csv
+- Uses ONLY the first TOP_N orders (default 6)
+- Builds 1-row-per-order simulator CSV (what IDEAS Clinic takes):
+    conv_num (1..4) + shape demand counts
+- Simulates the conveyor with FIFO "active order per conveyor" capture rule (matches lecture deck)
+- Searches a SMALL grid of strong heuristics (runs in seconds)
+- Outputs:
+    sim_input_BASELINE.csv
+    sim_input_BEST.csv
+    sim_input_SECOND_BEST.csv
+    strategy_results.csv          (all strategies ranked)
+    loading_plan_BASELINE.csv     (exact item-by-item feed order)
+    loading_plan_BEST.csv
+    loading_plan_SECOND_BEST.csv
 
-Usage:
-    python MSE433_warehousing_analysis.py
-
-Input files (same directory):
-    order_itemtypes.csv   order_quantities.csv   orders_totes.csv
-
-Outputs:
-    conveyor_input_LPT_PENALTY.csv   ← upload to IDEAS Clinic
-    (terminal prints full demo instructions)
+Important realism knobs:
+- TRAVEL_TIME: you timed ~6s to move one conveyor segment
+- LOADING_BELT_TIME: you observed ~5s between items dropping onto the belt
+  -> We model this as the *release interval* (one item every LOADING_BELT_TIME seconds)
+- We do NOT artificially delay totes by FULL_LOOP anymore.
+  We model the real process: you feed items sequentially, tote-by-tote.
 """
 
-from collections import defaultdict
-
-# ─────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────
-TRAVEL_TIME     = 6    # seconds between each conveyor scanner
-FULL_LOOP       = 24   # 4 conveyors × 6s = one full belt circulation
-NUM_LANES       = 4    # lanes 0, 1, 2, 3
-NUM_ORDERS      = 4    # demo: only first 4 orders
-ITEM_PLACE_TIME = 2    # seconds to physically place one item onto belt
-ITEM_NAMES      = ['circle', 'pentagon', 'trapezoid', 'triangle',
-                   'star',   'moon',     'heart',     'cross']
+from __future__ import annotations
+from dataclasses import dataclass
+from collections import defaultdict, deque
+from typing import Dict, List, Tuple, Optional, Callable, Any
+import heapq
+import os
+import csv
 
 
-# ─────────────────────────────────────────────
-# DATA LOADING
-# ─────────────────────────────────────────────
-def parse_file(path):
-    rows = []
-    with open(path, encoding='utf-8-sig') as f:
+# ==========================
+# TUNE THESE
+# ==========================
+TOP_N = 6
+NUM_CONVEYORS = 4
+TRAVEL_TIME = 6
+ITEM_PLACE_TIME = 2
+LOADING_BELT_TIME = 5
+RELEASE_INTERVAL = max(ITEM_PLACE_TIME, LOADING_BELT_TIME)
+
+# If you observed tote swapping takes time in real life, set this > 0
+TOTE_CHANGEOVER_TIME = 0
+
+MAX_PER_SHAPE_AVAILABLE = 8
+
+SHAPE_NAMES = ["circle", "pentagon", "trapezoid", "triangle", "star", "moon", "heart", "cross"]
+SIM_COLS = ["cirle", "pentagon", "trapezoid", "triangle", "star", "moon", "heart", "cross"]
+NUM_SHAPES = 8
+
+SHAPE_NAME_TO_COL = {
+    "circle": "cirle",
+    "pentagon": "pentagon",
+    "trapezoid": "trapezoid",
+    "triangle": "triangle",
+    "star": "star",
+    "moon": "moon",
+    "heart": "heart",
+    "cross": "cross",
+}
+
+# ==========================
+# DEFAULT TEST MODE
+# ==========================
+# If True:
+#   - Tote sequence is fixed
+#   - Within-tote ordering is fixed
+#   - Only conveyor assignment strategies are compared
+#
+# This matches your presentation slide and real-life testing setup.
+COMPARE_CONVEYOR_ONLY = True
+FIXED_TOTE_RULE = "ID_ASC"
+FIXED_WITHIN_RULE = "BPF"
+
+
+# ==========================
+# Data structures
+# ==========================
+@dataclass
+class Order:
+    id: int
+    types: List[int]
+    qtys: List[int]
+    totes: List[int]
+
+
+# ==========================
+# CSV loading
+# ==========================
+def _read_rows(path: str) -> List[List[str]]:
+    rows: List[List[str]] = []
+    with open(path, encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            rows.append([p.strip() for p in line.split(',') if p.strip()])
+            parts = [p.strip() for p in line.split(",") if p.strip() != ""]
+            rows.append(parts)
     return rows
 
 
-def load_orders(types_path, qty_path, totes_path):
-    t = parse_file(types_path)
-    q = parse_file(qty_path)
-    r = parse_file(totes_path)
-    return [{'id': i,
-             'types':      [int(float(v)) for v in t[i]],
-             'quantities': [int(float(v)) for v in q[i]],
-             'totes':      [int(float(v)) for v in r[i]]}
-            for i in range(NUM_ORDERS)]
+def load_orders_first_n(types_path: str, qty_path: str, totes_path: str, n: int) -> List[Order]:
+    t = _read_rows(types_path)
+    q = _read_rows(qty_path)
+    r = _read_rows(totes_path)
+
+    total = min(len(t), len(q), len(r), n)
+    orders: List[Order] = []
+
+    for i in range(total):
+        types = [int(float(x)) for x in t[i] if x != ""]
+        qtys = [int(float(x)) for x in q[i] if x != ""]
+        totes = [int(float(x)) for x in r[i] if x != ""]
+
+        m = min(len(types), len(qtys), len(totes))
+        orders.append(Order(id=i, types=types[:m], qtys=qtys[:m], totes=totes[:m]))
+
+    return orders
 
 
-def build_indexes(orders):
-    tote_contents   = defaultdict(lambda: [0] * 8)
-    tote_orders_map = defaultdict(set)
+# ==========================
+# Basic helpers
+# ==========================
+def order_demand_vector(o: Order) -> List[int]:
+    dem = [0] * NUM_SHAPES
+    for s, q in zip(o.types, o.qtys):
+        if 0 <= s < NUM_SHAPES and q > 0:
+            dem[s] += q
+    return dem
+
+
+def total_items_in_order(o: Order) -> int:
+    return sum(order_demand_vector(o))
+
+
+def unique_totes_in_order(o: Order) -> int:
+    return len(set(o.totes))
+
+
+def distinct_shapes_in_order(o: Order) -> int:
+    return len(set(s for s, q in zip(o.types, o.qtys) if q > 0))
+
+
+def fragmentation_score(o: Order) -> int:
+    """
+    Rough measure of operational complexity.
+    Larger if the order spans many tote-shape combinations.
+    """
+    score = 0
+    for s, q, t in zip(o.types, o.qtys, o.totes):
+        if q > 0:
+            score += 1
+    return score
+
+
+def build_tote_contents(orders: List[Order]) -> Dict[int, List[int]]:
+    tote_contents = defaultdict(lambda: [0] * NUM_SHAPES)
     for o in orders:
-        for j in range(len(o['types'])):
-            t = o['totes'][j]
-            tote_contents[t][o['types'][j]] += o['quantities'][j]
-            tote_orders_map[t].add(o['id'])
-    return (tote_contents, tote_orders_map,
-            {o['id']: sum(o['quantities'])  for o in orders},
-            {o['id']: len(set(o['totes'])) for o in orders},
-            {o['id']: set(o['totes'])       for o in orders},
-            sorted(tote_contents.keys()))
+        for s, q, t in zip(o.types, o.qtys, o.totes):
+            if 0 <= s < NUM_SHAPES and q > 0:
+                tote_contents[t][s] += q
+    return dict(tote_contents)
 
 
-# ─────────────────────────────────────────────
-# DECISION 1 — TOTE SEQUENCING HEURISTICS
-# ─────────────────────────────────────────────
-def totes_baseline(all_totes, **_):
-    """Naive: ascending tote ID."""
+# ==========================
+# Tote sequencing heuristics
+# ==========================
+def totes_id_asc(all_totes: List[int], **_) -> List[int]:
     return sorted(all_totes)
 
 
-def totes_eocf(all_totes, tote_orders_map, order_num_totes, **_):
+def totes_mitf(all_totes: List[int], tote_contents: Dict[int, List[int]], **_) -> List[int]:
+    return sorted(all_totes, key=lambda t: -sum(tote_contents[t]))
+
+
+def totes_eocf(all_totes: List[int], tote_to_orders: Dict[int, List[int]], order_num_totes: Dict[int, int], **_) -> List[int]:
+    def key(t: int) -> int:
+        oids = tote_to_orders.get(t, [])
+        return min(order_num_totes[oid] for oid in oids) if oids else 10**9
+    return sorted(all_totes, key=key)
+
+
+def get_tote_rule(name: str) -> Tuple[str, Callable]:
+    mapping = {
+        "ID_ASC": ("ID_ASC", totes_id_asc),
+        "MITF": ("MITF", totes_mitf),
+        "EOCF": ("EOCF", totes_eocf),
+    }
+    if name not in mapping:
+        raise ValueError(f"Unknown tote rule: {name}")
+    return mapping[name]
+
+
+# ==========================
+# Conveyor assignment heuristics
+# ==========================
+def assign_baseline_cycle(orders: List[Order]) -> Dict[int, int]:
     """
-    EOCF – Earliest Order Completion First.
-    Loads totes that serve orders needing the FEWEST total totes first.
-    Single-tote orders get their items onto the belt earliest → complete fastest.
+    Simple FCFS-style cycle assignment:
+    order 0 -> conv 1
+    order 1 -> conv 2
+    ...
     """
-    return sorted(all_totes,
-                  key=lambda t: min(order_num_totes[oid]
-                                    for oid in tote_orders_map[t]))
+    return {o.id: (o.id % NUM_CONVEYORS) + 1 for o in orders}
 
 
-def totes_miptf(all_totes, tote_orders_map, **_):
+def estimate_order_workload(o: Order, wt_totes: float = 0.0) -> float:
     """
-    MIPTF – Most Items Per Tote First.
-    Loads totes that serve the most orders simultaneously first.
-    More orders advance in parallel per belt pass.
+    Revised workload estimate.
+
+    Base workload:
+      - total item count
+
+    If wt_totes > 0, we interpret that as turning on "complexity-aware balancing",
+    so the score also includes:
+      - number of unique totes
+      - number of distinct shapes
+      - fragmentation complexity
+
+    This is more realistic than using only items + #totes.
     """
-    return sorted(all_totes, key=lambda t: -len(tote_orders_map[t]))
+    items = total_items_in_order(o)
+    totes = unique_totes_in_order(o)
+    shapes = distinct_shapes_in_order(o)
+    frag = fragmentation_score(o)
+
+    # Baseline LPT: mostly item-driven
+    if wt_totes <= 0:
+        return float(items)
+
+    # Complexity-aware version:
+    # Keep the same single parameter interface, but make it do more useful work.
+    complexity = (
+        totes +
+        0.5 * shapes +
+        0.5 * frag
+    )
+    return float(items + wt_totes * complexity)
 
 
-# ─────────────────────────────────────────────
-# DECISION 2 — LANE ASSIGNMENT HEURISTICS
-# ─────────────────────────────────────────────
-def lanes_baseline(orders, **_):
-    """Naive: order 0 → lane 0, order 1 → lane 1, etc."""
-    return {o['id']: o['id'] for o in orders}
-
-
-def lanes_lpt_penalty(orders, tote_sequence, order_totes_set, **_):
+def assign_lpt_balance(orders: List[Order], wt_totes: float = 0.0) -> Dict[int, int]:
     """
-    LPT + Lane Penalty  ← PRIMARY MAKESPAN HEURISTIC
-    ─────────────────────────────────────────────────
-    With 4 orders × 4 lanes (no queuing), each order's earliest completion is:
-        completion = last_tote_arrival_time + lane × TRAVEL_TIME
-
-    To minimise makespan (= max completion), assign the order whose last tote
-    arrives LATEST to Lane 0 (zero travel penalty).  Second-latest to Lane 1, etc.
-
-    This is LPT (Longest Processing Time first) parallel machine scheduling:
-    the hardest job gets the best machine.
-
-    Why lane 0 is "best":
-        Lane 0 scanner is the FIRST hit every circulation.
-        An item in Lane 0 travels 0 extra seconds.
-        An item in Lane 3 travels 18 extra seconds.
-        Giving the hardest order the smallest travel penalty minimises makespan.
+    Greedy load balancing:
+      1. Score each order by estimated workload
+      2. Assign biggest orders first to the currently lightest conveyor
     """
-    def last_tote_time(oid):
-        return max(tote_sequence.index(t) for t in order_totes_set[oid]) * FULL_LOOP
-
-    sorted_oids = sorted([o['id'] for o in orders],
-                         key=lambda oid: -last_tote_time(oid))
-    return {oid: lane for lane, oid in enumerate(sorted_oids)}
-
-
-# ─────────────────────────────────────────────
-# DECISION 3 — ITEM LOADING SEQUENCE HEURISTICS
-# ─────────────────────────────────────────────
-def item_order_naive(items):
-    """Naive: place items in ascending item-type order (as you pick them up)."""
-    return sorted(items, key=lambda x: x[0])
-
-
-def item_order_furthest_lane_first(items):
-    """
-    Furthest Lane First (FLF)  ← PRIMARY ITEM SEQUENCING HEURISTIC
-    ──────────────────────────────────────────────────────────────────
-    Within a tote, place items going to the HIGHEST lane number first.
-
-    Why: An item for Lane 3 must travel past scanners 0, 1, 2 before
-    being sorted (18s travel time). An item for Lane 0 is sorted immediately.
-
-    If you place the Lane 3 item first, it is already travelling down
-    the belt while you place the Lane 0 item behind it.
-    Both arrive at their destination at nearly the same time.
-
-    If you place the Lane 0 item first, the Lane 3 item sits in your
-    hand waiting, then has to travel 18s AFTER the Lane 0 item is done.
-    Net result: the last item finishes later → higher makespan.
-
-    Analogy: if you're sending packages to addresses 1 block away and
-    4 blocks away, send the far one first so it's already en route.
-    """
-    return sorted(items, key=lambda x: -x[2])  # highest lane first
-
-
-# ─────────────────────────────────────────────
-# SIMULATION ENGINE
-# ─────────────────────────────────────────────
-def simulate(orders, tote_sequence, lane_assignment,
-             tote_contents, item_order_fn=item_order_furthest_lane_first):
-    """
-    Simulate the full conveyor system including item placement timing.
-
-    Model
-    -----
-    - Tote at position i is available at t = i × FULL_LOOP
-    - Each item takes ITEM_PLACE_TIME seconds to place on the belt
-    - Item placed at time p, going to lane k, is sorted at p + k × TRAVEL_TIME
-    - Order completion = time when its LAST item is sorted
-    - Makespan = max order completion
-    """
-    # Build item_type → lane lookup
-    item_to_lane = {}
-    item_to_order = {}
+    scores: Dict[int, float] = {}
     for o in orders:
-        lane = lane_assignment[o['id']]
-        for item_type in o['types']:
-            item_to_lane[item_type]  = lane
-            item_to_order[item_type] = o['id']
+        scores[o.id] = estimate_order_workload(o, wt_totes=wt_totes)
 
-    tote_load_start  = {t: idx * FULL_LOOP for idx, t in enumerate(tote_sequence)}
-    order_last_sort  = defaultdict(int)
+    sorted_orders = sorted(orders, key=lambda o: -scores[o.id])
+
+    load = {c: 0.0 for c in range(1, NUM_CONVEYORS + 1)}
+    assign: Dict[int, int] = {}
+
+    for o in sorted_orders:
+        c_best = min(load.keys(), key=lambda c: load[c])
+        assign[o.id] = c_best
+        load[c_best] += scores[o.id]
+
+    return assign
+
+
+# ==========================
+# Within-tote ordering heuristics
+# ==========================
+def shapes_naive(shape_qty: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+    return sorted(shape_qty, key=lambda x: x[0])
+
+
+def shapes_bpf(shape_qty: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+    return sorted(shape_qty, key=lambda x: -x[1])
+
+
+def shapes_flf(shape_qty: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+    return sorted(shape_qty, key=lambda x: -x[2])
+
+
+def shapes_wflf(shape_qty: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+    return sorted(shape_qty, key=lambda x: -(x[2] * x[1]))
+
+
+def get_within_rule(name: str) -> Tuple[str, Callable]:
+    mapping = {
+        "NAIVE": ("NAIVE", shapes_naive),
+        "BPF": ("BPF", shapes_bpf),
+        "FLF": ("FLF", shapes_flf),
+        "WFLF": ("WFLF", shapes_wflf),
+    }
+    if name not in mapping:
+        raise ValueError(f"Unknown within-tote rule: {name}")
+    return mapping[name]
+
+
+# ==========================
+# Build loading sequence
+# ==========================
+def build_loading_sequence(
+    tote_sequence: List[int],
+    tote_contents: Dict[int, List[int]],
+    conv_assignment: Dict[int, int],
+    orders: List[Order],
+    within_tote_rule: Callable[[List[Tuple[int, int, int]]], List[Tuple[int, int, int]]],
+) -> List[Dict[str, Any]]:
+    """
+    Builds the physical item release order.
+    Each item is released one at a time, every RELEASE_INTERVAL seconds.
+    """
+
+    orders_need_shape = {s: set() for s in range(NUM_SHAPES)}
+    for o in orders:
+        dem = order_demand_vector(o)
+        for s in range(NUM_SHAPES):
+            if dem[s] > 0:
+                orders_need_shape[s].add(o.id)
+
+    seq: List[Dict[str, Any]] = []
+    t_ptr = 0
+    step = 1
 
     for tote_id in tote_sequence:
-        t_start  = tote_load_start[tote_id]
-        contents = tote_contents[tote_id]
+        cont = tote_contents.get(tote_id, [0] * NUM_SHAPES)
 
-        items = [(item_type, contents[item_type], item_to_lane[item_type])
-                 for item_type in range(8)
-                 if contents[item_type] > 0 and item_type in item_to_lane]
+        shape_qty_lane: List[Tuple[int, int, int]] = []
+        for s in range(NUM_SHAPES):
+            q = cont[s]
+            if q <= 0:
+                continue
 
-        if not items:
+            lanes = [conv_assignment[oid] for oid in orders_need_shape[s]]
+            approx_lane = max(lanes) if lanes else 1
+            shape_qty_lane.append((s, q, approx_lane))
+
+        if not shape_qty_lane:
             continue
 
-        items_ordered  = item_order_fn(items)
-        placement_time = t_start
+        ordered_blocks = within_tote_rule(shape_qty_lane)
 
-        for item_type, qty, lane in items_ordered:
-            oid = item_to_order[item_type]
-            for _ in range(qty):
-                sort_time = placement_time + lane * TRAVEL_TIME
-                order_last_sort[oid] = max(order_last_sort[oid], sort_time)
-                placement_time += ITEM_PLACE_TIME
+        for s, q, _lane in ordered_blocks:
+            for _ in range(q):
+                seq.append({
+                    "step": step,
+                    "time_release": t_ptr,
+                    "tote_id": tote_id,
+                    "shape_num": s,
+                    "shape_name": SHAPE_NAMES[s],
+                })
+                step += 1
+                t_ptr += RELEASE_INTERVAL
 
-    makespan = max(order_last_sort.values())
-    total_ct = sum(order_last_sort.values())
+        t_ptr += TOTE_CHANGEOVER_TIME
+
+    return seq
+
+
+def write_loading_plan_csv(sequence: List[Dict[str, Any]], path: str) -> None:
+    fieldnames = ["step", "time_release", "tote_id", "shape_num", "shape_name"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in sequence:
+            w.writerow(row)
+
+
+# ==========================
+# Simulation
+# ==========================
+def simulate(
+    orders: List[Order],
+    conv_assignment: Dict[int, int],
+    loading_sequence: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Event-driven conveyor simulator.
+
+    Logic:
+    - items are injected at conveyor 1 according to the loading sequence
+    - each move to next conveyor takes TRAVEL_TIME
+    - each conveyor has a FIFO order queue
+    - only the active order (front of queue) can capture
+    - if it doesn't need the item, the item keeps circulating
+    """
+
+    remaining = {o.id: order_demand_vector(o)[:] for o in orders}
+    remaining_total = {oid: sum(vec) for oid, vec in remaining.items()}
+    total_needed = sum(remaining_total.values())
+
+    queues = {c: deque() for c in range(1, NUM_CONVEYORS + 1)}
+    for o in sorted(orders, key=lambda x: x.id):
+        queues[conv_assignment[o.id]].append(o.id)
+
+    def active_order(c: int) -> Optional[int]:
+        while queues[c]:
+            oid = queues[c][0]
+            if remaining_total[oid] > 0:
+                return oid
+            queues[c].popleft()
+        return None
+
+    completion_time: Dict[int, Optional[int]] = {o.id: None for o in orders}
+
+    events: List[Tuple[int, int, int]] = []
+    for item in loading_sequence:
+        heapq.heappush(events, (int(item["time_release"]), 1, int(item["shape_num"])))
+
+    captured = 0
+
+    while events and captured < total_needed:
+        t, c, s = heapq.heappop(events)
+
+        oid = active_order(c)
+        if oid is not None and remaining[oid][s] > 0:
+            remaining[oid][s] -= 1
+            remaining_total[oid] -= 1
+            captured += 1
+
+            if remaining_total[oid] == 0 and completion_time[oid] is None:
+                completion_time[oid] = t
+        else:
+            c_next = (c % NUM_CONVEYORS) + 1
+            heapq.heappush(events, (t + TRAVEL_TIME, c_next, s))
+
+    comp = [ct for ct in completion_time.values() if ct is not None]
+    makespan = max(comp) if comp else 0
+    total_ct = sum(comp) if comp else 0
+    avg_ct = total_ct / len(comp) if comp else 0
+
     return {
-        'order_completion': dict(order_last_sort),
-        'makespan':         makespan,
-        'total_completion': total_ct,
-        'avg_completion':   total_ct / len(order_last_sort),
+        "makespan": makespan,
+        "total_completion": total_ct,
+        "avg_completion": avg_ct,
+        "completion_time": {k: (v if v is not None else -1) for k, v in completion_time.items()},
     }
 
 
-# ─────────────────────────────────────────────
-# CONVEYOR INPUT CSV  (one row per order/lane)
-# ─────────────────────────────────────────────
-def write_conveyor_input(orders, lane_assignment, filepath):
-    """
-    Each row = one lane.
-    conv_num = lane number.
-    Item columns = total quantity of each item type that order needs.
-    The conveyor system uses this to know what to drop into each bin.
-    Note: 'cirle' typo matches the IDEAS Clinic template exactly.
-    """
-    lines = ['conv_num,cirle,pentagon,trapezoid,triangle,star,moon,heart,cross']
-    for lane in range(NUM_LANES):
-        oid = next(o for o, l in lane_assignment.items() if l == lane)
-        o   = next(x for x in orders if x['id'] == oid)
-        row = [0] * 8
-        for j in range(len(o['types'])):
-            row[o['types'][j]] += o['quantities'][j]
-        lines.append(f"{lane}," + ','.join(str(v) for v in row))
-    with open(filepath, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
-    print(f"  → Saved: {filepath}")
+# ==========================
+# Output writers
+# ==========================
+def write_sim_input(orders: List[Order], conv_assignment: Dict[int, int], path: str) -> None:
+    header = "conv_num," + ",".join(SIM_COLS)
+    lines = [header]
+
+    for o in sorted(orders, key=lambda x: x.id):
+        dem = order_demand_vector(o)
+        conv_num = conv_assignment[o.id]
+        row = [str(conv_num)] + [str(dem[i]) for i in range(NUM_SHAPES)]
+        lines.append(",".join(row))
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
-# ─────────────────────────────────────────────
-# REPORTING
-# ─────────────────────────────────────────────
-def print_comparison(results, baseline_r):
-    best_ms = min(r['makespan'] for r in results.values())
-    print("=" * 88)
-    print(f"  {'Strategy':<38}  {'Makespan':>9}  {'%Δ MS':>7}  {'Total CT':>9}  {'Avg CT':>8}")
-    print("  " + "─" * 82)
-    for name, r in results.items():
-        dm   = (r['makespan'] - baseline_r['makespan']) / baseline_r['makespan'] * 100
-        flag = "  ★ RECOMMENDED" if name == '★ EOCF + LPT+Penalty + FLF Items' else ""
-        print(f"  {name:<38}  {r['makespan']:>7.0f}s ({dm:>+5.1f}%)  "
-              f"{r['total_completion']:>7.0f}s  {r['avg_completion']:>7.1f}s{flag}")
-    print()
+def write_strategy_results_csv(results: List[Dict[str, Any]], path: str) -> None:
+    fieldnames = [
+        "rank",
+        "tote_rule",
+        "conv_rule",
+        "within_rule",
+        "makespan",
+        "total_completion",
+        "avg_completion",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in results:
+            w.writerow({k: row[k] for k in fieldnames})
 
 
-def print_demo_instructions(best_r, tote_seq, lane_assignment,
-                             orders, tote_contents, item_to_lane):
-    print("=" * 65)
-    print("  COMPLETE DEMO INSTRUCTIONS")
-    print("=" * 65)
+# ==========================
+# Strategy search
+# ==========================
+def run_strategy_search(
+    orders: List[Order]
+) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], List[Dict[str, Any]]]:
 
-    print(f"\n  ─── STEP 1: Upload conveyor_input_LPT_PENALTY.csv ───")
-    print(f"  This tells each lane what items to sort into its bin:\n")
-    print(f"  {'Lane':>5}  {'Order':>6}  Contents")
-    print(f"  {'─'*5}  {'─'*6}  {'─'*40}")
-    for lane in range(NUM_LANES):
-        oid = next(o for o, l in lane_assignment.items() if l == lane)
-        o   = next(x for x in orders if x['id'] == oid)
-        contents = ', '.join(f"{ITEM_NAMES[o['types'][j]]}×{o['quantities'][j]}"
-                             for j in range(len(o['types'])))
-        print(f"  {lane:>5}  {oid:>6}  {contents}")
+    tote_contents = build_tote_contents(orders)
+    all_totes = sorted(tote_contents.keys())
 
-    print(f"\n  ─── STEP 2: Load totes in this sequence ───\n")
-    for pos, tote_id in enumerate(tote_seq):
-        contents = tote_contents[tote_id]
-        items_str = ', '.join(f"{ITEM_NAMES[k]}×{contents[k]}"
-                              for k in range(8) if contents[k] > 0)
-        print(f"  Position {pos+1}: Load Tote {tote_id}  ({items_str})")
-
-    print(f"\n  ─── STEP 3: Within each tote, place items in this order ───")
-    print(f"  Rule: FURTHEST LANE FIRST — highest lane number goes on belt first")
-    print(f"  (items going further need more travel time → get them moving first)\n")
-
-    for pos, tote_id in enumerate(tote_seq):
-        contents = tote_contents[tote_id]
-        items = [(item_type, contents[item_type], item_to_lane[item_type])
-                 for item_type in range(8)
-                 if contents[item_type] > 0 and item_type in item_to_lane]
-        if not items:
-            continue
-        items_sorted = sorted(items, key=lambda x: -x[2])
-        print(f"  Tote {tote_id}:")
-        for rank, (item_type, qty, lane) in enumerate(items_sorted, 1):
-            oid = next(o for o, l in lane_assignment.items() if l == lane)
-            travel = lane * TRAVEL_TIME
-            print(f"    {rank}. {qty}× {ITEM_NAMES[item_type]:<12} "
-                  f"→ Lane {lane} (travels {travel}s to scanner)  "
-                  f"[Order {oid}]")
-        print()
-
-    print(f"  ─── KPI Results ───\n")
-    print(f"  Makespan : {best_r['makespan']}s  (theoretical optimum — cannot do better)")
-    print(f"  Total CT : {best_r['total_completion']}s")
-    print(f"  Avg CT   : {best_r['avg_completion']:.1f}s")
-    print()
-
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-def main():
-    orders = load_orders('order_itemtypes.csv',
-                         'order_quantities.csv',
-                         'orders_totes.csv')
-
-    (tote_contents, tote_orders_map,
-     order_total_items, order_num_totes,
-     order_totes_set, all_totes) = build_indexes(orders)
-
-    ctx = dict(orders=orders, all_totes=all_totes,
-               tote_orders_map=tote_orders_map,
-               order_num_totes=order_num_totes,
-               order_total_items=order_total_items,
-               order_totes_set=order_totes_set)
-
-    tseq_b = totes_baseline(**ctx)
-    tseq_e = totes_eocf(**ctx)
-    tseq_m = totes_miptf(**ctx)
-
-    lanes_b   = lanes_baseline(**ctx)
-    lanes_lpt_b = lanes_lpt_penalty(tote_sequence=tseq_b, **ctx)
-    lanes_lpt_e = lanes_lpt_penalty(tote_sequence=tseq_e, **ctx)
-    lanes_lpt_m = lanes_lpt_penalty(tote_sequence=tseq_m, **ctx)
-
-    # All 6 strategies × 2 item orderings = compare clearly
-    strategies = {
-        'Baseline (naive everything)':       (tseq_b, lanes_b,     item_order_naive),
-        'EOCF Totes + Naive Lanes':          (tseq_e, lanes_b,     item_order_naive),
-        'Baseline + LPT+Penalty':            (tseq_b, lanes_lpt_b, item_order_naive),
-        'EOCF + LPT+Penalty (naive items)':  (tseq_e, lanes_lpt_e, item_order_naive),
-        '★ EOCF + LPT+Penalty + FLF Items': (tseq_e, lanes_lpt_e, item_order_furthest_lane_first),
-    }
-
-    results = {name: simulate(orders, ts, la, tote_contents, fn)
-               for name, (ts, la, fn) in strategies.items()}
-
-    print("\n")
-    print("=" * 65)
-    print("  MSE 433 — Warehousing Demo: Heuristic Comparison")
-    print(f"  Orders: {NUM_ORDERS}  |  Lanes: {NUM_LANES}  |  "
-          f"Item placement time: {ITEM_PLACE_TIME}s each")
-    print("=" * 65)
-    print()
-    print_comparison(results, results['Baseline (naive everything)'])
-
-    # Best strategy
-    best_tseq  = tseq_e
-    best_lanes = lanes_lpt_e
-
-    # Build item_to_lane for instructions
-    item_to_lane = {}
+    tote_to_orders = defaultdict(list)
+    order_num_totes: Dict[int, int] = {}
     for o in orders:
-        lane = best_lanes[o['id']]
-        for item_type in o['types']:
-            item_to_lane[item_type] = lane
+        order_num_totes[o.id] = len(set(o.totes))
+        for t in set(o.totes):
+            tote_to_orders[t].append(o.id)
 
-    best_r = results['★ EOCF + LPT+Penalty + FLF Items']
-    print_demo_instructions(best_r, best_tseq, best_lanes,
-                            orders, tote_contents, item_to_lane)
+    if COMPARE_CONVEYOR_ONLY:
+        tote_rules = [get_tote_rule(FIXED_TOTE_RULE)]
+        within_rules = [get_within_rule(FIXED_WITHIN_RULE)]
+    else:
+        tote_rules = [
+            ("ID_ASC", totes_id_asc),
+            ("MITF", totes_mitf),
+            ("EOCF", totes_eocf),
+        ]
+        within_rules = [
+            ("NAIVE", shapes_naive),
+            ("BPF", shapes_bpf),
+            ("FLF", shapes_flf),
+            ("WFLF", shapes_wflf),
+        ]
 
-    print("Writing conveyor input CSV:")
-    write_conveyor_input(orders, best_lanes, 'conveyor_input_LPT_PENALTY.csv')
-    print()
+    conv_rules = [
+        ("BASELINE_CYCLE", lambda os_: assign_baseline_cycle(os_)),
+        ("LPT_BALANCE", lambda os_: assign_lpt_balance(os_, wt_totes=0.0)),
+        ("LPT_BALANCE_WT", lambda os_: assign_lpt_balance(os_, wt_totes=2.0)),
+    ]
+
+    # Baseline plan = fixed tote + baseline conveyor + fixed within
+    baseline_tote_name, baseline_tote_fn = tote_rules[0]
+    baseline_within_name, baseline_within_fn = within_rules[0]
+
+    baseline_assign = assign_baseline_cycle(orders)
+    baseline_totes = baseline_tote_fn(
+        all_totes=all_totes,
+        tote_contents=tote_contents,
+        tote_to_orders=tote_to_orders,
+        order_num_totes=order_num_totes,
+    )
+    baseline_loading = build_loading_sequence(
+        baseline_totes,
+        tote_contents,
+        baseline_assign,
+        orders,
+        baseline_within_fn,
+    )
+    baseline_res = simulate(orders, baseline_assign, baseline_loading)
+
+    baseline_plan = {
+        "tote_rule": baseline_tote_name,
+        "conv_rule": "BASELINE_CYCLE",
+        "within_rule": baseline_within_name,
+        "tote_sequence": baseline_totes,
+        "conv_assignment": baseline_assign,
+        "tote_contents": tote_contents,
+        "loading_sequence": baseline_loading,
+        "baseline_res": baseline_res,
+    }
+
+    all_results: List[Dict[str, Any]] = []
+
+    for tote_name, tote_fn in tote_rules:
+        tote_seq = tote_fn(
+            all_totes=all_totes,
+            tote_contents=tote_contents,
+            tote_to_orders=tote_to_orders,
+            order_num_totes=order_num_totes,
+        )
+
+        for conv_name, conv_fn in conv_rules:
+            conv_assign = conv_fn(orders)
+
+            for within_name, within_fn in within_rules:
+                loading_seq = build_loading_sequence(
+                    tote_seq,
+                    tote_contents,
+                    conv_assign,
+                    orders,
+                    within_fn,
+                )
+                res = simulate(orders, conv_assign, loading_seq)
+
+                all_results.append({
+                    "tote_rule": tote_name,
+                    "conv_rule": conv_name,
+                    "within_rule": within_name,
+                    "makespan": res["makespan"],
+                    "total_completion": res["total_completion"],
+                    "avg_completion": res["avg_completion"],
+                    "tote_sequence": tote_seq,
+                    "conv_assignment": conv_assign,
+                    "loading_sequence": loading_seq,
+                })
+
+    # Rank by makespan first, then by total completion, then avg completion
+    all_results.sort(key=lambda r: (r["makespan"], r["total_completion"], r["avg_completion"]))
+    for i, r in enumerate(all_results, 1):
+        r["rank"] = i
+
+    best = all_results[0]
+    second_best = all_results[1] if len(all_results) > 1 else None
+
+    best_plan = {
+        "tote_rule": best["tote_rule"],
+        "conv_rule": best["conv_rule"],
+        "within_rule": best["within_rule"],
+        "tote_sequence": best["tote_sequence"],
+        "conv_assignment": best["conv_assignment"],
+        "tote_contents": tote_contents,
+        "loading_sequence": best["loading_sequence"],
+        "baseline_res": baseline_res,
+    }
+
+    second_plan = None
+    if second_best:
+        second_plan = {
+            "tote_rule": second_best["tote_rule"],
+            "conv_rule": second_best["conv_rule"],
+            "within_rule": second_best["within_rule"],
+            "tote_sequence": second_best["tote_sequence"],
+            "conv_assignment": second_best["conv_assignment"],
+            "tote_contents": tote_contents,
+            "loading_sequence": second_best["loading_sequence"],
+            "baseline_res": baseline_res,
+        }
+
+    return baseline_plan, best_plan, second_plan, all_results
 
 
-if __name__ == '__main__':
+# ==========================
+# Printing helpers
+# ==========================
+def _print_plan(label: str, orders: List[Order], plan: Dict[str, Any], res: Dict[str, Any]) -> None:
+    base = plan["baseline_res"]
+    delta = (res["makespan"] - base["makespan"]) / base["makespan"] * 100.0 if base["makespan"] else 0.0
+
+    print("\n" + "-" * 90)
+    print(label)
+    print("-" * 90)
+    print(f"Tote={plan['tote_rule']} | ConvAssign={plan['conv_rule']} | WithinTote={plan['within_rule']}")
+    print(f"Makespan={res['makespan']}s | TotalCT={res['total_completion']}s | AvgCT={res['avg_completion']:.1f}s")
+    print(f"%Δ Makespan vs baseline: {delta:+.1f}%")
+
+    queues = defaultdict(list)
+    for o in sorted(orders, key=lambda x: x.id):
+        queues[plan["conv_assignment"][o.id]].append(o.id)
+
+    print("\nConveyor queues (conv_num -> order ids in FIFO queue):")
+    for c in range(1, NUM_CONVEYORS + 1):
+        print(f"  Conveyor {c}: {queues[c]}")
+
+    print("\nTote order:")
+    for i, t in enumerate(plan["tote_sequence"], 1):
+        cont = plan["tote_contents"][t]
+        items = ", ".join(
+            f"{SHAPE_NAMES[s]}×{cont[s]}"
+            for s in range(NUM_SHAPES)
+            if cont[s] > 0
+        )
+        print(f"  {i:>2}. Tote {t}: {items}")
+
+
+def _warn_if_shape_cap_exceeded(orders: List[Order]) -> None:
+    total = [0] * NUM_SHAPES
+    for o in orders:
+        dem = order_demand_vector(o)
+        for s in range(NUM_SHAPES):
+            total[s] += dem[s]
+
+    exceeded = [(SHAPE_NAMES[s], total[s]) for s in range(NUM_SHAPES) if total[s] > MAX_PER_SHAPE_AVAILABLE]
+    if exceeded:
+        print("\n" + "!" * 90)
+        print("WARNING: Your selected TOP_N orders exceed the available items cap (8 per shape).")
+        for name, qty in exceeded:
+            print(f"  - {name}: need {qty}, cap is {MAX_PER_SHAPE_AVAILABLE}")
+        print("Fix: lower TOP_N or choose a subset of orders so each shape total <= 8.")
+        print("!" * 90 + "\n")
+
+
+# ==========================
+# MAIN
+# ==========================
+def main() -> None:
+    input_dir = os.path.join("data", "input")
+    output_dir = os.path.join("data", "output")
+
+    types_path = os.path.join(input_dir, "order_itemtypes.csv")
+    qty_path = os.path.join(input_dir, "order_quantities.csv")
+    totes_path = os.path.join(input_dir, "orders_totes.csv")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for p in (types_path, qty_path, totes_path):
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Missing {p}. Put the 3 generator files in this folder.")
+
+    orders = load_orders_first_n(types_path, qty_path, totes_path, TOP_N)
+    _warn_if_shape_cap_exceeded(orders)
+
+    baseline_plan, best_plan, second_plan, all_results = run_strategy_search(orders)
+
+    sim_baseline_path = os.path.join(output_dir, "sim_input_BASELINE.csv")
+    sim_best_path = os.path.join(output_dir, "sim_input_BEST.csv")
+    sim_second_path = os.path.join(output_dir, "sim_input_SECOND_BEST.csv")
+    load_baseline_path = os.path.join(output_dir, "loading_plan_BASELINE.csv")
+    load_best_path = os.path.join(output_dir, "loading_plan_BEST.csv")
+    load_second_path = os.path.join(output_dir, "loading_plan_SECOND_BEST.csv")
+    results_path = os.path.join(output_dir, "strategy_results.csv")
+
+    write_sim_input(orders, baseline_plan["conv_assignment"], sim_baseline_path)
+    write_sim_input(orders, best_plan["conv_assignment"], sim_best_path)
+    if second_plan is not None:
+        write_sim_input(orders, second_plan["conv_assignment"], sim_second_path)
+
+    write_loading_plan_csv(baseline_plan["loading_sequence"], load_baseline_path)
+    write_loading_plan_csv(best_plan["loading_sequence"], load_best_path)
+    if second_plan is not None:
+        write_loading_plan_csv(second_plan["loading_sequence"], load_second_path)
+
+    write_strategy_results_csv(all_results, results_path)
+
+    print("\n" + "=" * 90)
+    print("MSE 433 — REALISM-ALIGNED CONVEYOR STRATEGY SEARCH")
+    print("=" * 90)
+    print(f"Orders used: {len(orders)} (rows 0..{len(orders)-1}) | Conveyors: {NUM_CONVEYORS}")
+    print(f"TRAVEL_TIME={TRAVEL_TIME}s | LOADING_BELT_TIME={LOADING_BELT_TIME}s | RELEASE_INTERVAL={RELEASE_INTERVAL}s")
+    print(f"COMPARE_CONVEYOR_ONLY={COMPARE_CONVEYOR_ONLY} | FIXED_TOTE_RULE={FIXED_TOTE_RULE} | FIXED_WITHIN_RULE={FIXED_WITHIN_RULE}")
+    print("=" * 90)
+
+    _print_plan("PLAN A — BASELINE", orders, baseline_plan, baseline_plan["baseline_res"])
+    best_res = simulate(orders, best_plan["conv_assignment"], best_plan["loading_sequence"])
+    _print_plan("PLAN B — BEST", orders, best_plan, best_res)
+
+    if second_plan is not None:
+        second_res = simulate(orders, second_plan["conv_assignment"], second_plan["loading_sequence"])
+        _print_plan("PLAN C — SECOND BEST", orders, second_plan, second_res)
+
+    print("\nSaved files:")
+    print(f"  - {sim_baseline_path}")
+    print(f"  - {sim_best_path}")
+    if second_plan is not None:
+        print(f"  - {sim_second_path}")
+    print(f"  - {results_path}")
+    print(f"  - {load_baseline_path}")
+    print(f"  - {load_best_path}")
+    if second_plan is not None:
+        print(f"  - {load_second_path}")
+
+
+if __name__ == "__main__":
     main()
