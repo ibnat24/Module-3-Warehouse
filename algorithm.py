@@ -1,30 +1,17 @@
 """
-MSE 433 — Module 3 Conveyor Strategy (FAST) + TOP2 + RESULTS + LOADING PLANS
-============================================================================
+MSE 433 — Module 3 conveyor strategy simulation.
 
-What this script does:
-- Loads generator CSVs:
-    order_itemtypes.csv, order_quantities.csv, orders_totes.csv
-- Uses ONLY the first TOP_N orders (default 6)
-- Builds 1-row-per-order simulator CSV (what IDEAS Clinic takes):
-    conv_num (1..4) + shape demand counts
-- Simulates the conveyor with FIFO "active order per conveyor" capture rule (matches lecture deck)
-- Searches a SMALL grid of strong heuristics (runs in seconds)
-- Outputs:
-    sim_input_BASELINE.csv
-    sim_input_BEST.csv
-    sim_input_SECOND_BEST.csv
-    strategy_results.csv          (all strategies ranked)
-    loading_plan_BASELINE.csv     (exact item-by-item feed order)
-    loading_plan_BEST.csv
-    loading_plan_SECOND_BEST.csv
+This script evaluates heuristics across three decision layers:
+1) conveyor assignment, 2) tote sequencing, 3) within-tote item ordering.
 
-Important realism knobs:
-- TRAVEL_TIME: you timed ~6s to move one conveyor segment
-- LOADING_BELT_TIME: you observed ~5s between items dropping onto the belt
-  -> We model this as the *release interval* (one item every LOADING_BELT_TIME seconds)
-- We do NOT artificially delay totes by FULL_LOOP anymore.
-  We model the real process: you feed items sequentially, tote-by-tote.
+Default behavior evaluates the full 3 x 3 x 4 grid (36 strategy combinations)
+and ranks plans by makespan, then total completion time, then average completion time.
+
+Simulation assumptions mirror the IDEAS Clinic setup:
+- 4 conveyor stations in a loop
+- item release rate is supply-constrained to one item every 5 seconds
+- travel time between stations is 6 seconds (24 seconds full loop)
+- only the active order at the front of each station queue can capture items
 """
 
 from __future__ import annotations
@@ -44,7 +31,8 @@ NUM_CONVEYORS = 4
 TRAVEL_TIME = 6
 ITEM_PLACE_TIME = 2
 LOADING_BELT_TIME = 5
-RELEASE_INTERVAL = max(ITEM_PLACE_TIME, LOADING_BELT_TIME)
+# Supply-constrained model: one item enters the system every 5 seconds.
+RELEASE_INTERVAL = LOADING_BELT_TIME
 
 # If you observed tote swapping takes time in real life, set this > 0
 TOTE_CHANGEOVER_TIME = 0
@@ -69,13 +57,9 @@ SHAPE_NAME_TO_COL = {
 # ==========================
 # DEFAULT TEST MODE
 # ==========================
-# If True:
-#   - Tote sequence is fixed
-#   - Within-tote ordering is fixed
-#   - Only conveyor assignment strategies are compared
-#
-# This matches your presentation slide and real-life testing setup.
-COMPARE_CONVEYOR_ONLY = True
+# If True, tote and within-tote rules are fixed and only conveyor assignment is compared.
+# If False, the full 3 x 3 x 4 heuristic grid is evaluated (36 combinations).
+COMPARE_CONVEYOR_ONLY = False
 FIXED_TOTE_RULE = "ID_ASC"
 FIXED_WITHIN_RULE = "BPF"
 
@@ -213,36 +197,18 @@ def assign_baseline_cycle(orders: List[Order]) -> Dict[int, int]:
 
 def estimate_order_workload(o: Order, wt_totes: float = 0.0) -> float:
     """
-    Revised workload estimate.
+        Workload score used for LPT-based conveyor assignment.
 
-    Base workload:
-      - total item count
-
-    If wt_totes > 0, we interpret that as turning on "complexity-aware balancing",
-    so the score also includes:
-      - number of unique totes
-      - number of distinct shapes
-      - fragmentation complexity
-
-    This is more realistic than using only items + #totes.
+        LPT_BALANCE:          score = total_items
+        LPT_BALANCE_WT (2.0): score = total_items + 2 * unique_totes
     """
     items = total_items_in_order(o)
     totes = unique_totes_in_order(o)
-    shapes = distinct_shapes_in_order(o)
-    frag = fragmentation_score(o)
 
-    # Baseline LPT: mostly item-driven
     if wt_totes <= 0:
         return float(items)
 
-    # Complexity-aware version:
-    # Keep the same single parameter interface, but make it do more useful work.
-    complexity = (
-        totes +
-        0.5 * shapes +
-        0.5 * frag
-    )
-    return float(items + wt_totes * complexity)
+    return float(items + wt_totes * totes)
 
 
 def assign_lpt_balance(orders: List[Order], wt_totes: float = 0.0) -> Dict[int, int]:
@@ -711,6 +677,7 @@ def main() -> None:
     print("=" * 90)
     print(f"Orders used: {len(orders)} (rows 0..{len(orders)-1}) | Conveyors: {NUM_CONVEYORS}")
     print(f"TRAVEL_TIME={TRAVEL_TIME}s | LOADING_BELT_TIME={LOADING_BELT_TIME}s | RELEASE_INTERVAL={RELEASE_INTERVAL}s")
+    print(f"Strategy combinations tested: {len(all_results)}")
     print(f"COMPARE_CONVEYOR_ONLY={COMPARE_CONVEYOR_ONLY} | FIXED_TOTE_RULE={FIXED_TOTE_RULE} | FIXED_WITHIN_RULE={FIXED_WITHIN_RULE}")
     print("=" * 90)
 
