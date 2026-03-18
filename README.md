@@ -48,20 +48,6 @@ Edit these constants near the top of `algorithm.py`:
 - `RELEASE_INTERVAL = max(ITEM_PLACE_TIME, LOADING_BELT_TIME)`.
 - `TOTE_CHANGEOVER_TIME = 0`: optional tote swap penalty.
 
-### Strategy Search Mode
-
-By default, the script compares only conveyor assignment while keeping tote and within-tote rules fixed:
-
-- `COMPARE_CONVEYOR_ONLY = True`
-- `FIXED_TOTE_RULE = "ID_ASC"`
-- `FIXED_WITHIN_RULE = "BPF"`
-
-If you set `COMPARE_CONVEYOR_ONLY = False`, it runs a fuller grid search:
-
-- Tote rules: `ID_ASC`, `MITF`, `EOCF`
-- Conveyor rules: `BASELINE_CYCLE`, `LPT_BALANCE`, `LPT_BALANCE_WT`
-- Within-tote rules: `NAIVE`, `BPF`, `FLF`, `WFLF`
-
 ## Heuristics Implemented
 
 ### Tote Sequencing
